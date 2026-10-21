@@ -1,0 +1,1 @@
+python C:\veighna_studio\Tools\i18n\pygettext.py -o vnpy_ctastrategydr\locale\vnpy_ctastrategydr.pot  vnpy_ctastrategydr\*.py vnpy_ctastrategydr\ui\*.py vnpy_ctastrategydr\strategies\*.py

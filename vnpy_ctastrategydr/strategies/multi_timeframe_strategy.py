@@ -1,6 +1,6 @@
 """多周期策略。"""
 
-from vnpy_ctastrategy import (
+from vnpy_ctastrategydr import (
     CtaTemplate,
     StopOrder,
     TickData,

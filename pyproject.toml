@@ -1,5 +1,5 @@
 [project]
-name = "vnpy_ctastrategy"
+name = "vnpy_ctastrategydr"
 dynamic = ["version"]
 description = "CTA strategy application for VeighNa quant trading framework."
 readme = "README.md"
@@ -39,21 +39,21 @@ requires = ["hatchling>=1.27.0", "babel>=2.17.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
-path = "vnpy_ctastrategy/__init__.py"
+path = "vnpy_ctastrategydr/__init__.py"
 pattern = "__version__ = ['\"](?P<version>[^'\"]+)['\"]"
 
 [tool.hatch.build.targets.wheel]
-packages = ["vnpy_ctastrategy"]
+packages = ["vnpy_ctastrategydr"]
 include-package-data = true
 
 [tool.hatch.build.targets.sdist]
-include = ["vnpy_ctastrategy*"]
+include = ["vnpy_ctastrategydr*"]
 
 [tool.hatch.build.hooks.custom]
-path = "vnpy_ctastrategy/locale/build_hook.py"
+path = "vnpy_ctastrategydr/locale/build_hook.py"
 
 [tool.hatch.build.targets.wheel.force-include]
-"vnpy_ctastrategy/locale/en/LC_MESSAGES/vnpy_ctastrategy.mo" = "vnpy_ctastrategy/locale/en/LC_MESSAGES/vnpy_ctastrategy.mo"
+"vnpy_ctastrategydr/locale/en/LC_MESSAGES/vnpy_ctastrategydr.mo" = "vnpy_ctastrategydr/locale/en/LC_MESSAGES/vnpy_ctastrategydr.mo"
 
 [tool.ruff]
 target-version = "py310"

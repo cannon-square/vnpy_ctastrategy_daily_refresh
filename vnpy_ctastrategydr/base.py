@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from vnpy.trader.constant import Direction, Offset, Interval
 from .locale import _
 
-APP_NAME: str = "CtaStrategy"
+APP_NAME: str = "CtaStrategyDr"
 STOPORDER_PREFIX: str = "STOP"
 
 
@@ -49,9 +49,9 @@ class StopOrder:
     status: StopOrderStatus = StopOrderStatus.WAITING
 
 
-EVENT_CTA_LOG: str = "eCtaLog"
-EVENT_CTA_STRATEGY: str = "eCtaStrategy"
-EVENT_CTA_STOPORDER: str = "eCtaStopOrder"
+EVENT_CTA_LOG: str = "eCtaDrLog"
+EVENT_CTA_STRATEGY: str = "eCtaStrategyDr"
+EVENT_CTA_STOPORDER: str = "eCtaDrStopOrder"
 
 
 INTERVAL_DELTA_MAP: dict[Interval, timedelta] = {

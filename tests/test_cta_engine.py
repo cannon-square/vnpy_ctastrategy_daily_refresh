@@ -15,9 +15,9 @@ from vnpy.trader.object import (
     SubscribeRequest,
     TickData,
 )
-from vnpy_ctastrategy.base import APP_NAME, STOPORDER_PREFIX, StopOrder, StopOrderStatus
-from vnpy_ctastrategy.engine import CtaEngine
-from vnpy_ctastrategy.template import CtaTemplate
+from vnpy_ctastrategydr.base import APP_NAME, STOPORDER_PREFIX, StopOrder, StopOrderStatus
+from vnpy_ctastrategydr.engine import CtaEngine
+from vnpy_ctastrategydr.template import CtaTemplate
 
 
 class FakeGateway:
@@ -164,8 +164,8 @@ def build_engine() -> EngineRig:
 
 @pytest.fixture
 def rig(monkeypatch: pytest.MonkeyPatch) -> Iterator[EngineRig]:
-    monkeypatch.setattr("vnpy_ctastrategy.engine.get_database", _disconnected_service)
-    monkeypatch.setattr("vnpy_ctastrategy.engine.get_datafeed", _disconnected_service)
+    monkeypatch.setattr("vnpy_ctastrategydr.engine.get_database", _disconnected_service)
+    monkeypatch.setattr("vnpy_ctastrategydr.engine.get_datafeed", _disconnected_service)
     built: EngineRig = build_engine()
     try:
         yield built

@@ -1,0 +1,1 @@
+python C:\veighna_studio\Tools\i18n\msgfmt.py -o vnpy_ctastrategydr\locale\en\LC_MESSAGES\vnpy_ctastrategydr.mo vnpy_ctastrategydr\locale\en\LC_MESSAGES\vnpy_ctastrategydr

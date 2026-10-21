@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from vnpy_ctastrategy import (
+from vnpy_ctastrategydr import (
     CtaTemplate,
     StopOrder,
     TickData,

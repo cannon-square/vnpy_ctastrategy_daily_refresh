@@ -6,6 +6,6 @@ from pathlib import Path
 
 localedir: Path = Path(__file__).parent
 
-translations: gettext.NullTranslations = gettext.translation('vnpy_ctastrategy', localedir=localedir, fallback=True)
+translations: gettext.NullTranslations = gettext.translation('vnpy_ctastrategydr', localedir=localedir, fallback=True)
 
 _ = translations.gettext

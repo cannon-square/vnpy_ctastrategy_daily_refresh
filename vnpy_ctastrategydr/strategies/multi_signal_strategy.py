@@ -1,6 +1,6 @@
 """多信号策略。"""
 
-from vnpy_ctastrategy import (
+from vnpy_ctastrategydr import (
     StopOrder,
     TickData,
     BarData,

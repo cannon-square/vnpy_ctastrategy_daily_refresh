@@ -3,7 +3,7 @@
 from collections.abc import Callable
 from time import time
 
-from vnpy_ctastrategy import (
+from vnpy_ctastrategydr import (
     CtaTemplate,
     StopOrder,
     TickData,

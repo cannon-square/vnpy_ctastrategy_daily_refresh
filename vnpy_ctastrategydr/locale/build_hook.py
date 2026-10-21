@@ -17,9 +17,9 @@ class LocaleBuildHook(BuildHookInterface):
         if "pure_python" not in build_data:
             return
 
-        self.locale_path: Path = Path(self.root).joinpath("vnpy_ctastrategy", "locale")
-        self.mo_path: Path = self.locale_path.joinpath("en", "LC_MESSAGES", "vnpy_ctastrategy.mo")
-        self.po_path: Path = self.locale_path.joinpath("en", "LC_MESSAGES", "vnpy_ctastrategy.po")
+        self.locale_path: Path = Path(self.root).joinpath("vnpy_ctastrategydr", "locale")
+        self.mo_path: Path = self.locale_path.joinpath("en", "LC_MESSAGES", "vnpy_ctastrategydr.mo")
+        self.po_path: Path = self.locale_path.joinpath("en", "LC_MESSAGES", "vnpy_ctastrategydr.po")
 
         mo_f: BinaryIO
         with open(self.mo_path, "wb") as mo_f:

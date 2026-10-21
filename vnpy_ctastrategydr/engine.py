@@ -73,8 +73,8 @@ class CtaEngine(BaseEngine):
 
     engine_type: EngineType = EngineType.LIVE  # live trading engine
 
-    setting_filename: str = "cta_strategy_setting.json"
-    data_filename: str = "cta_strategy_data.json"
+    setting_filename: str = "cta_strategy_dr_setting.json"
+    data_filename: str = "cta_strategy_dr_data.json"
 
     def __init__(self, main_engine: MainEngine, event_engine: EventEngine) -> None:
         """初始化策略容器、停止单计数和数据服务。"""
@@ -802,7 +802,7 @@ class CtaEngine(BaseEngine):
         从源代码加载策略类。
         """
         path1: Path = Path(__file__).parent.joinpath("strategies")
-        self.load_strategy_class_from_folder(path1, "vnpy_ctastrategy.strategies")
+        self.load_strategy_class_from_folder(path1, "vnpy_ctastrategydr.strategies")
 
         path2: Path = Path.cwd().joinpath("strategies")
         self.load_strategy_class_from_folder(path2, "strategies")

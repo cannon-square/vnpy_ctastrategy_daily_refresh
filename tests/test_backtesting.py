@@ -4,9 +4,9 @@ from typing import cast
 from vnpy.trader.constant import Direction, Exchange, Interval, Offset, Status
 from vnpy.trader.object import BarData, OrderData, TradeData
 
-from vnpy_ctastrategy.backtesting import BacktestingEngine
-from vnpy_ctastrategy.base import STOPORDER_PREFIX, StopOrder, StopOrderStatus
-from vnpy_ctastrategy.template import CtaTemplate
+from vnpy_ctastrategydr.backtesting import BacktestingEngine
+from vnpy_ctastrategydr.base import STOPORDER_PREFIX, StopOrder, StopOrderStatus
+from vnpy_ctastrategydr.template import CtaTemplate
 
 
 VT_SYMBOL: str = "rb2501.SHFE"

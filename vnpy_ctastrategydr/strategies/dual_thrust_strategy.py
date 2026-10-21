@@ -1,7 +1,7 @@
 """Dual Thrust策略。"""
 
 from datetime import time
-from vnpy_ctastrategy import (
+from vnpy_ctastrategydr import (
     CtaTemplate,
     StopOrder,
     TickData,
