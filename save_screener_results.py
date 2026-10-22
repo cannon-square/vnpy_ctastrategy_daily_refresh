@@ -1,7 +1,7 @@
 """Run a finviz screen and save the matching tickers to data/screener.db.
 
 Usage: save_screener_results.py [premarket|momentum]   (default: premarket)
-    premarket -> gap-up screen for 07:00-09:30 ET, sorted by gap
+    premarket -> gap-up screen for 04:05-09:30 ET, sorted by gap
     momentum  -> up-on-the-day screen for after the open, sorted by % change
 
 Each run writes:
@@ -16,12 +16,14 @@ Each run writes:
     news            -> new finviz headlines and SEC filings for each ticker (catalysts.py)
 
 A run whose tickers (in rank order) and numbers all match the previous run of
-the same screen is not saved. Prints the vnpy vt_symbols (SYMBOL.EXCHANGE) joined with "," for the
+the same screen is not saved, nor is a run made before finviz rolls over to the
+new session (see is_stale). Prints the vnpy vt_symbols (SYMBOL.EXCHANGE) joined with "," for the
 portfolio strategy vt_symbols field, and whether the run was saved or skipped
 to stderr.
 """
 import argparse
 import json
+import sqlite3
 import sys
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -76,6 +78,31 @@ def to_shares(millions: float | None) -> int | None:
     return None if millions is None else round(millions * 1_000_000)
 
 
+def is_stale(conn: sqlite3.Connection, rows: list[dict[str, Any]], tickers: list[tuple[str, str]], today: str) -> bool:
+    """True when finviz still shows the previous session's data.
+
+    Until finviz rolls over (around 04:00 ET), its prevClose is the one already
+    saved for the previous trading day. The run is stale when most tickers seen
+    on an earlier day still report that day's prev_close.
+    """
+    comparable = unchanged = 0
+    for row, (symbol, exchange) in zip(rows, tickers, strict=True):
+        prev_close = row["numbers"].get("prevClose")
+        earlier = conn.execute(
+            """
+            SELECT d.prev_close FROM daily_levels d JOIN symbols s ON s.id = d.symbol_id
+            WHERE s.symbol = ? AND s.exchange = ? AND d.trade_date < ? AND d.prev_close IS NOT NULL
+            ORDER BY d.trade_date DESC LIMIT 1
+            """,
+            (symbol, exchange, today),
+        ).fetchone()
+        if prev_close is None or earlier is None:
+            continue
+        comparable += 1
+        unchanged += abs(earlier["prev_close"] - prev_close) <= 1e-9 * max(abs(prev_close), 1)
+    return unchanged * 2 > comparable
+
+
 def main(screen: str = "premarket") -> None:
     url = SCREENS[screen]
     criteria = parse_qs(urlparse(url).query)["f"][0]
@@ -97,6 +124,10 @@ def main(screen: str = "premarket") -> None:
 
     init_db()
     with connect() as conn:
+        if is_stale(conn, rows, tickers, today):
+            print(f"{screen}: skipped: finviz still shows the previous session ({len(tickers)} tickers)",
+                  file=sys.stderr)
+            return
         previous_run = conn.execute(
             "SELECT MAX(id) FROM scan_runs WHERE screen = ? AND criteria = ?", (screen, criteria)
         ).fetchone()[0]

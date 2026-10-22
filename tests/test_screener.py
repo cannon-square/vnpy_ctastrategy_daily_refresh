@@ -768,3 +768,41 @@ def test_no_datafeed_configured(offline: dict[str, Any], monkeypatch: pytest.Mon
     monkeypatch.setattr(levels, "get_datafeed", BaseDatafeed)
     levels.update_levels(add_level_rows([("AAA", MARKET_TODAY, 2.0, None)]))
     assert "no datafeed configured" in capsys.readouterr().err
+
+
+# Stale finviz data -------------------------------------------------------------
+
+def add_earlier_prev_close(prev_closes: dict[str, float]) -> None:
+    """Save prev_close rows for the day before today, as an earlier session would."""
+    db.init_db()
+    yesterday = (db.now().date() - timedelta(days=1)).isoformat()
+    exchanges = {"AAA": "NASDAQ", "BBB": "NYSE", "CCC": "AMEX"}
+    with db.connect() as conn:
+        for symbol, prev_close in prev_closes.items():
+            symbol_id = db.get_symbol_id(conn, symbol, exchanges[symbol])
+            conn.execute("INSERT INTO daily_levels (symbol_id, trade_date, prev_close) VALUES (?, ?, ?)",
+                         (symbol_id, yesterday, prev_close))
+
+
+def test_stale_previous_session_is_not_saved(offline: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+    add_earlier_prev_close({"AAA": 2.0, "BBB": 2.0})  # finviz still reports yesterday's prev close
+    ssr.main()
+
+    assert "premarket: skipped: finviz still shows the previous session (3 tickers)" in capsys.readouterr().err
+    assert query("SELECT COUNT(*) FROM scan_runs") == [(0,)]
+    today = db.now().date().isoformat()
+    assert query("SELECT COUNT(*) FROM daily_levels WHERE trade_date = ?", (today,)) == [(0,)]
+    assert query("SELECT COUNT(*) FROM share_structure") == [(0,)]
+    assert (offline["news_calls"], offline["feed"].calls) == (0, 0)
+
+
+def test_rolled_over_session_is_saved(offline: dict[str, Any]) -> None:
+    add_earlier_prev_close({"AAA": 1.5, "BBB": 1.8})
+    ssr.main()
+    assert query("SELECT COUNT(*) FROM scan_runs") == [(1,)]
+
+
+def test_one_unchanged_close_is_not_enough(offline: dict[str, Any]) -> None:
+    add_earlier_prev_close({"AAA": 2.0, "BBB": 1.8})  # AAA closed flat; BBB rolled over
+    ssr.main()
+    assert query("SELECT COUNT(*) FROM scan_runs") == [(1,)]
