@@ -7,8 +7,9 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable, Iterator
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as clock
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -16,9 +17,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import requests
+from vnpy.trader.constant import Interval
+from vnpy.trader.database import DB_TZ
+from vnpy.trader.datafeed import BaseDatafeed
+from vnpy.trader.object import BarData, HistoryRequest
 
 import catalysts
 import db
+import levels
 import save_screener_results as ssr
 import sec
 
@@ -80,16 +86,51 @@ def submissions(filings: list[tuple[str, datetime, str]]) -> dict[str, Any]:
     }}}
 
 
+class FakeDatafeed(BaseDatafeed):
+    """Behaves like vnpy_massive: naive system-local bar times, errors reported via output."""
+
+    def __init__(self) -> None:
+        self.bars: dict[tuple[str, Interval | None], list[tuple[datetime, float, float]]] = {}  # (time, high, close)
+        self.same_day = True
+        self.error: str | None = None
+        self.calls = 0
+
+    def init(self, output: Callable[[str], Any] = print) -> bool:
+        self.calls += 1
+        return True
+
+    def query_bar_history(self, req: HistoryRequest, output: Callable[[str], Any] = print) -> list[BarData]:
+        self.calls += 1
+        if self.error:
+            output(self.error)
+            return []
+        today = datetime.now(levels.MARKET_TZ).date()
+        if not self.same_day and req.end is not None and req.end.astimezone(levels.MARKET_TZ).date() >= today:
+            output('HTTP 403: {"status":"NOT_AUTHORIZED","message":"Your plan doesn\'t include this data timeframe."}')
+            return []
+        result = []
+        for when, high, close in self.bars.get((req.symbol, req.interval), []):
+            local = when.astimezone().replace(tzinfo=None)
+            if req.start <= local <= (req.end or local):
+                result.append(BarData(
+                    symbol=req.symbol, exchange=req.exchange, datetime=local.replace(tzinfo=DB_TZ),
+                    interval=req.interval, high_price=high, close_price=close, gateway_name="FAKE",
+                ))
+        return result
+
+
 @pytest.fixture
 def offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
-    """Point the database and SEC cache at tmp_path and fake finviz and the SEC."""
+    """Point the database and SEC cache at tmp_path and fake finviz, the SEC and the datafeed."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "screener.db")
     monkeypatch.setattr(sec, "CACHE_PATH", tmp_path / "sec_company_tickers.json")
     monkeypatch.setattr(catalysts, "FINVIZ_DELAY", 0)
+    feed = FakeDatafeed()
+    monkeypatch.setattr(levels, "get_datafeed", lambda: feed)
     state: dict[str, Any] = {
         "rows": ROWS, "sec_online": True, "sec_calls": 0,
         "news": {}, "news_calls": 0, "news_error": False,
-        "filings": {}, "filings_calls": 0,
+        "filings": {}, "filings_calls": 0, "feed": feed,
     }
 
     def fake_get(url: str, **kwargs: Any) -> FakeResponse:
@@ -581,3 +622,149 @@ def test_news_failure_keeps_run_and_retries(offline: dict[str, Any], capsys: pyt
     offline["rows"] = ROWS[::-1]
     ssr.main()
     assert offline["news_calls"] == calls + 3
+
+
+# Chart levels ----------------------------------------------------------------
+
+MARKET_TODAY: date = datetime.now(levels.MARKET_TZ).date()
+
+
+def market(hour: int, minute: int = 0, day: date | None = None) -> datetime:
+    return datetime.combine(day or MARKET_TODAY, clock(hour, minute), tzinfo=levels.MARKET_TZ)
+
+
+def set_now(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
+    monkeypatch.setattr(db, "now", lambda: when.astimezone(db.TIMEZONE))
+
+
+def add_level_rows(rows: list[tuple[str, date, float | None, float | None]]) -> list[int]:
+    """Insert daily_levels rows (symbol, trade_date, prev_close, prev_high); return symbol ids."""
+    db.init_db()
+    ids: list[int] = []
+    with db.connect() as conn:
+        for symbol, day, prev_close, prev_high in rows:
+            symbol_id = db.get_symbol_id(conn, symbol, "NASDAQ")
+            conn.execute("INSERT INTO daily_levels (symbol_id, trade_date, prev_close, prev_high) VALUES (?, ?, ?, ?)",
+                         (symbol_id, day.isoformat(), prev_close, prev_high))
+            ids.append(symbol_id)
+    return ids
+
+
+def level(symbol: str, column: str, day: date = MARKET_TODAY) -> Any:
+    return query(f"SELECT d.{column} FROM daily_levels d JOIN symbols s ON s.id = d.symbol_id "
+                 "WHERE s.symbol = ? AND d.trade_date = ?", (symbol, day.isoformat()))[0][0]
+
+
+def test_prev_high_needs_matching_close(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    feed: FakeDatafeed = offline["feed"]
+    feed.same_day = False
+    ids = add_level_rows([("AAA", MARKET_TODAY, 2.0, None), ("BBB", MARKET_TODAY, 2.0, None)])
+    yesterday = MARKET_TODAY - timedelta(days=1)
+    feed.bars[("AAA", Interval.DAILY)] = [(market(0, day=yesterday - timedelta(days=2)), 9.9, 1.0),
+                                          (market(0, day=yesterday), 2.4, 2.0)]
+    feed.bars[("BBB", Interval.DAILY)] = [(market(0, day=yesterday), 3.0, 1.5)]  # not yet the right day
+    set_now(monkeypatch, market(7))
+
+    levels.update_levels(ids, budget=10)
+    assert (level("AAA", "prev_high"), level("BBB", "prev_high")) == (2.4, None)
+
+    feed.bars[("BBB", Interval.DAILY)] = [(market(0, day=yesterday), 3.0, 2.01)]  # within 1%
+    levels.update_levels(ids, budget=10)
+    assert level("BBB", "prev_high") == 3.0
+
+
+def test_budget_limits_calls_in_rank_order(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                            capsys: pytest.CaptureFixture[str]) -> None:
+    feed: FakeDatafeed = offline["feed"]
+    feed.same_day = False
+    ids = add_level_rows([("AAA", MARKET_TODAY, 2.0, None), ("BBB", MARKET_TODAY, 2.0, None),
+                          ("CCC", MARKET_TODAY, 2.0, None)])
+    for symbol in ("AAA", "BBB", "CCC"):
+        feed.bars[(symbol, Interval.DAILY)] = [(market(0, day=MARKET_TODAY - timedelta(days=1)), 2.5, 2.0)]
+    set_now(monkeypatch, market(7))
+
+    levels.update_levels([ids[2], ids[0], ids[1]], budget=2)  # init + one bar request
+
+    assert feed.calls == 2
+    assert (level("CCC", "prev_high"), level("AAA", "prev_high"), level("BBB", "prev_high")) == (2.5, None, None)
+    # 2 prev_high, plus 3 premarket_high not yet known to be unavailable on this plan
+    assert "5 left for later runs" in capsys.readouterr().err
+
+
+def test_no_same_day_data_is_remembered(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                        capsys: pytest.CaptureFixture[str]) -> None:
+    feed: FakeDatafeed = offline["feed"]
+    feed.same_day = False
+    ids = add_level_rows([("AAA", MARKET_TODAY, 2.0, 2.5)])
+    set_now(monkeypatch, market(8))
+
+    levels.update_levels(ids, budget=10)
+    assert "plan has no same-day data" in capsys.readouterr().err
+    state = json.loads((db.DB_PATH.parent / levels.STATE_FILE).read_text())
+    assert state == {"no_same_day_data": MARKET_TODAY.isoformat()}
+
+    calls = feed.calls
+    levels.update_levels(ids, budget=10)
+    assert feed.calls == calls
+    assert level("AAA", "premarket_high") is None
+
+
+def test_same_day_premarket_high_refresh_and_final(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    feed: FakeDatafeed = offline["feed"]
+    ids = add_level_rows([("AAA", MARKET_TODAY, 2.0, 2.5)])
+    feed.bars[("AAA", Interval.MINUTE)] = [(market(3, 59), 9.0, 9.0), (market(5), 2.6, 2.6), (market(7, 30), 2.7, 2.7)]
+
+    set_now(monkeypatch, market(8))
+    levels.update_levels(ids, budget=10)
+    assert level("AAA", "premarket_high") == 2.7  # 03:59 is before the pre-market window
+
+    feed.bars[("AAA", Interval.MINUTE)] += [(market(9, 29), 2.8, 2.8), (market(9, 30), 5.0, 5.0)]
+    calls = feed.calls
+    set_now(monkeypatch, market(8, 10))
+    levels.update_levels(ids, budget=10)
+    assert feed.calls == calls  # refreshed less than 15 minutes ago
+
+    set_now(monkeypatch, market(9, 31))
+    levels.update_levels(ids, budget=10)
+    assert level("AAA", "premarket_high") == 2.8  # 09:30 is the open, not pre-market
+
+    calls = feed.calls
+    set_now(monkeypatch, market(9, 50))
+    levels.update_levels(ids, budget=10)
+    assert feed.calls == calls  # final after the open
+
+
+def test_earlier_day_premarket_high_backfilled_once(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    feed: FakeDatafeed = offline["feed"]
+    feed.same_day = False
+    yesterday = MARKET_TODAY - timedelta(days=1)
+    ids = add_level_rows([("AAA", yesterday, 2.0, 2.5), ("BBB", yesterday, 2.0, 2.5)])
+    feed.bars[("AAA", Interval.MINUTE)] = [(market(6, day=yesterday), 1.9, 1.9)]  # BBB: no pre-market trades
+    set_now(monkeypatch, market(7))
+
+    levels.update_levels(ids, budget=10)
+    assert (level("AAA", "premarket_high", yesterday), level("BBB", "premarket_high", yesterday)) == (1.9, None)
+
+    calls = feed.calls
+    levels.update_levels(ids, budget=10)
+    assert feed.calls == calls
+
+
+def test_feed_error_stops_the_run(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                  capsys: pytest.CaptureFixture[str]) -> None:
+    feed: FakeDatafeed = offline["feed"]
+    feed.error = "MassiveDatafeed 查询K线数据失败：Max retries exceeded"
+    ids = add_level_rows([("AAA", MARKET_TODAY, 2.0, None), ("BBB", MARKET_TODAY, 2.0, None)])
+    set_now(monkeypatch, market(7))
+
+    levels.update_levels(ids, budget=10)
+
+    assert feed.calls == 2  # init + the failed request
+    assert "levels: prev_high for AAA" in capsys.readouterr().err
+
+
+def test_no_datafeed_configured(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+                                capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr(levels, "get_datafeed", BaseDatafeed)
+    levels.update_levels(add_level_rows([("AAA", MARKET_TODAY, 2.0, None)]))
+    assert "no datafeed configured" in capsys.readouterr().err

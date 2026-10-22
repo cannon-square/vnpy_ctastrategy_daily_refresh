@@ -11,7 +11,8 @@ Each run writes:
     scan_results    -> one row per ticker: rank, price, gap %, change %, rel volume, volume
     share_structure -> today's float, shares outstanding, short float %, short ratio and
                        recent offering flag for each ticker
-    daily_levels    -> today's previous close for each ticker
+    daily_levels    -> today's previous close for each ticker; previous high and
+                       pre-market high from vnpy's datafeed (levels.py)
     news            -> new finviz headlines and SEC filings for each ticker (catalysts.py)
 
 A run whose tickers (in rank order) and numbers all match the previous run of
@@ -31,6 +32,7 @@ from lxml import html
 
 from catalysts import update_catalysts
 from db import connect, get_company_id, get_symbol_id, init_db, now, now_text
+from levels import update_levels
 from sec import load_cik_map
 
 # Custom view (v=152) columns: 0 No., 1 Ticker, 2 Company, 129 Exchange,
@@ -175,8 +177,9 @@ def main(screen: str = "premarket") -> None:
                     (symbol_id, today, numbers["prevClose"]),
                 )
 
-    # The run is saved first; news checks are slower and allowed to fail.
+    # The run is saved first; news and level checks are slower and allowed to fail.
     update_catalysts(listings)
+    update_levels([symbol_id for symbol_id, _, _ in listings])
 
     print(",".join(f"{symbol}.{exchange}" for symbol, exchange in tickers))
 
