@@ -2,10 +2,45 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from tzlocal import get_localzone_name
+from vnpy.trader.setting import SETTINGS
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "screener.db"
 
+# Time zone for all stored times and dates: "screener.timezone" in vnpy's
+# vt_setting.json (a dropdown in the vnpy GUI's global settings), else the
+# system time zone. Daylight saving is applied by zoneinfo.
+TIMEZONE = ZoneInfo(SETTINGS.get("screener.timezone") or get_localzone_name())
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# Bumped by migrations; stored in PRAGMA user_version.
+# 1: scan_runs.run_at converted from UTC to local time.
+# 2: scan_runs.screen added; earlier runs are all "premarket".
+# 3: share_structure.short_ratio added.
+SCHEMA_VERSION = 3
+
+
+def now() -> datetime:
+    """Current time in TIMEZONE."""
+    return datetime.now(TIMEZONE)
+
+
+def now_text() -> str:
+    return now().strftime(TIME_FORMAT)
+
+
+def utc_to_local(text: str) -> str:
+    """Convert a stored UTC "YYYY-MM-DD HH:MM:SS" time to TIMEZONE."""
+    utc = datetime.strptime(text, TIME_FORMAT).replace(tzinfo=timezone.utc)
+    return utc.astimezone(TIMEZONE).strftime(TIME_FORMAT)
+
+
+# All times are in TIMEZONE, as "YYYY-MM-DD HH:MM:SS" text. The run_at column
+# default uses the system time zone; the screener always sets run_at itself.
 SCHEMA = """
 -- One row per company, keyed by its permanent SEC CIK
 CREATE TABLE IF NOT EXISTS companies (
@@ -25,12 +60,14 @@ CREATE TABLE IF NOT EXISTS symbols (
     UNIQUE (symbol, exchange, company_id)
 );
 
--- One row per screener run
+-- One row per screener run; screen is the name in SCREENS, e.g. "premarket"
 CREATE TABLE IF NOT EXISTS scan_runs (
     id       INTEGER PRIMARY KEY,
-    run_at   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    run_at   DATETIME NOT NULL DEFAULT (datetime('now', 'localtime')),
+    screen   TEXT NOT NULL DEFAULT 'premarket',
     criteria TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_scan_runs_screen ON scan_runs (screen, id);
 
 -- One row per ticker per run, with its numbers at that moment
 CREATE TABLE IF NOT EXISTS scan_results (
@@ -64,6 +101,7 @@ CREATE TABLE IF NOT EXISTS share_structure (
     float_shares       INTEGER,
     shares_outstanding INTEGER,
     short_float_pct    REAL,
+    short_ratio        REAL,  -- days to cover; reported twice a month, so often stale
     recent_offering    INTEGER,
     PRIMARY KEY (symbol_id, as_of)
 );
@@ -193,8 +231,9 @@ def migrate_legacy(conn: sqlite3.Connection) -> None:
             exchanges = []
         exchanges += [""] * (len(symbols) - len(exchanges))
         run_id = conn.execute(
+            # time_added was stored in UTC
             "INSERT INTO scan_runs (run_at, criteria) VALUES (?, ?)",
-            (row["time_added"], row["criteria"] or ""),
+            (utc_to_local(row["time_added"]), row["criteria"] or ""),
         ).lastrowid
         for rank, (symbol, exchange) in enumerate(zip(symbols, exchanges[:len(symbols)], strict=True), start=1):
             conn.execute(
@@ -212,21 +251,38 @@ def init_db() -> None:
         ).fetchone()
         if has_symbols:
             add_company_to_symbols(conn)
+        has_runs = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'scan_runs'"
+        ).fetchone()
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        # An existing scan_runs table must gain screen before SCHEMA indexes it.
+        if has_runs and "screen" not in {row["name"] for row in conn.execute("PRAGMA table_info(scan_runs)")}:
+            conn.execute("ALTER TABLE scan_runs ADD COLUMN screen TEXT NOT NULL DEFAULT 'premarket'")
         conn.executescript(SCHEMA)
+        if "short_ratio" not in {row["name"] for row in conn.execute("PRAGMA table_info(share_structure)")}:
+            conn.execute("ALTER TABLE share_structure ADD COLUMN short_ratio REAL")
+        if has_runs and version < 1:
+            # Runs saved before version 1 used SQLite's UTC CURRENT_TIMESTAMP.
+            for run in conn.execute("SELECT id, run_at FROM scan_runs").fetchall():
+                conn.execute(
+                    "UPDATE scan_runs SET run_at = ? WHERE id = ?", (utc_to_local(run["run_at"]), run["id"])
+                )
         migrate_legacy(conn)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
 
-def latest_vt_symbols() -> list[str]:
-    """vnpy vt_symbols (SYMBOL.EXCHANGE) from the most recent run, in rank order."""
+def latest_vt_symbols(screen: str = "premarket") -> list[str]:
+    """vnpy vt_symbols (SYMBOL.EXCHANGE) from the screen's most recent run, in rank order."""
     with connect() as conn:
         rows = conn.execute(
             """
             SELECT s.symbol || '.' || s.exchange AS vt_symbol
             FROM scan_results r
             JOIN symbols s ON s.id = r.symbol_id
-            WHERE r.run_id = (SELECT MAX(id) FROM scan_runs)
+            WHERE r.run_id = (SELECT MAX(id) FROM scan_runs WHERE screen = ?)
             ORDER BY r.rank
-            """
+            """,
+            (screen,),
         ).fetchall()
     return [row["vt_symbol"] for row in rows]
 

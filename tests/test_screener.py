@@ -8,9 +8,11 @@ import os
 import sqlite3
 import time
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -26,6 +28,7 @@ def make_row(ticker: str, exchange: str = "NASD", price: float = 2.5, gap: float
         "numbers": {
             "price": price, "gap": gap, "change": 15.0, "relativeVolume": 8.0,
             "volume": 1_000_000, "sharesFloat": 4.5, "prevClose": 2.0,
+            "sharesOutstanding2": 6.25, "shortInterestShare": 12.5, "shortInterestRatio": 1.75,
         },
     }
 
@@ -78,9 +81,83 @@ def query(sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
         conn.close()
 
 
+def utc_to_local(text: str) -> str:
+    utc = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    return utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def test_scrape_rows_reads_every_page(offline: dict[str, Any]) -> None:
-    rows = ssr.scrape_rows(ssr.url)
+    rows = ssr.scrape_rows(ssr.SCREENS["premarket"])
     assert [r["text"]["ticker"] for r in rows] == ["AAA", "BBB", "CCC"]
+
+
+# finviz ignores unknown filter codes instead of failing, so pin them here.
+KNOWN_FILTERS = {"ta_gap_u4", "ta_change_u10", "sh_curvol_o100", "sh_relvol_o2", "sh_price_1to20", "sh_float_u50"}
+
+
+@pytest.mark.parametrize("screen, order", [("premarket", "-gap"), ("momentum", "-change")])
+def test_screen_urls(screen: str, order: str) -> None:
+    query = parse_qs(urlparse(ssr.SCREENS[screen]).query)
+    assert set(query["f"][0].split(",")) <= KNOWN_FILTERS
+    assert query["o"] == [order]
+    assert query["c"] == [ssr.COLUMNS]
+
+
+def test_premarket_criteria_unchanged() -> None:
+    # Runs are compared by criteria; changing it would split the premarket history.
+    criteria = parse_qs(urlparse(ssr.SCREENS["premarket"]).query)["f"][0]
+    assert criteria == "ta_gap_u4,sh_curvol_o100,sh_relvol_o2,sh_price_1to20,sh_float_u50"
+
+
+def test_screens_are_saved_and_compared_separately(offline: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+    ssr.main("premarket")
+    ssr.main("momentum")
+    ssr.main("momentum")
+
+    assert query("SELECT id, screen FROM scan_runs ORDER BY id") == [(1, "premarket"), (2, "momentum")]
+    assert "momentum: skipped: unchanged since run 2" in capsys.readouterr().err
+    # Both screens share symbols and companies.
+    assert query("SELECT COUNT(*) FROM symbols") == [(3,)]
+
+    offline["rows"] = ROWS[:1]
+    ssr.main("momentum")
+    assert db.latest_vt_symbols("momentum") == ["AAA.NASDAQ"]
+    assert db.latest_vt_symbols() == ["AAA.NASDAQ", "BBB.NYSE", "CCC.AMEX"]
+
+
+def test_adds_short_ratio_to_existing_share_structure(offline: dict[str, Any]) -> None:
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.executescript(
+        """
+        CREATE TABLE share_structure (symbol_id INTEGER NOT NULL, as_of DATE NOT NULL, float_shares INTEGER,
+            shares_outstanding INTEGER, short_float_pct REAL, recent_offering INTEGER, PRIMARY KEY (symbol_id, as_of));
+        INSERT INTO share_structure (symbol_id, as_of, float_shares) VALUES (1, '2026-10-21', 100);
+        PRAGMA user_version = 2;
+        """
+    )
+    conn.close()
+
+    db.init_db()
+
+    assert query("SELECT float_shares, short_ratio FROM share_structure") == [(100, None)]
+    assert query("PRAGMA user_version") == [(3,)]
+
+
+def test_adds_screen_to_existing_runs(offline: dict[str, Any]) -> None:
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.executescript(
+        """
+        CREATE TABLE scan_runs (id INTEGER PRIMARY KEY, run_at DATETIME NOT NULL, criteria TEXT NOT NULL);
+        INSERT INTO scan_runs (run_at, criteria) VALUES ('2026-10-21 19:36:03', 'crit');
+        PRAGMA user_version = 1;
+        """
+    )
+    conn.close()
+
+    db.init_db()
+
+    assert query("SELECT run_at, screen FROM scan_runs") == [("2026-10-21 19:36:03", "premarket")]
+    assert query("PRAGMA user_version") == [(db.SCHEMA_VERSION,)]
 
 
 def test_main_saves_run_results_and_daily_values(offline: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
@@ -96,9 +173,85 @@ def test_main_saves_run_results_and_daily_values(offline: dict[str, Any], capsys
         ("BBB", 2, 2.5, 20.0, 15.0, 8.0, 1_000_000),
         ("CCC", 3, 2.5, 20.0, 15.0, 8.0, 1_000_000),
     ]
-    assert query("SELECT DISTINCT float_shares FROM share_structure") == [(4_500_000,)]
+    assert query(
+        "SELECT DISTINCT float_shares, shares_outstanding, short_float_pct, short_ratio FROM share_structure"
+    ) == [(4_500_000, 6_250_000, 12.5, 1.75)]
     assert query("SELECT DISTINCT prev_close FROM daily_levels") == [(2.0,)]
     assert query("PRAGMA foreign_key_check") == []
+
+
+def test_run_at_is_local_time(offline: dict[str, Any]) -> None:
+    before = datetime.now().replace(microsecond=0)
+    ssr.main()
+    after = datetime.now()
+
+    run_at = datetime.strptime(query("SELECT run_at FROM scan_runs")[0][0], "%Y-%m-%d %H:%M:%S")
+    assert before <= run_at <= after
+
+
+def test_utc_run_times_converted_once(offline: dict[str, Any]) -> None:
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.executescript(
+        """
+        CREATE TABLE scan_runs (id INTEGER PRIMARY KEY, run_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, criteria TEXT NOT NULL);
+        INSERT INTO scan_runs (run_at, criteria) VALUES ('2026-07-01 12:30:00', 'crit');
+        """
+    )
+    conn.close()
+
+    db.init_db()
+    db.init_db()
+
+    assert query("SELECT run_at FROM scan_runs") == [(utc_to_local("2026-07-01 12:30:00"),)]
+    assert query("PRAGMA user_version") == [(db.SCHEMA_VERSION,)]
+
+
+def test_times_use_timezone_setting(offline: dict[str, Any], monkeypatch: pytest.MonkeyPatch) -> None:
+    tokyo = ZoneInfo("Asia/Tokyo")
+    monkeypatch.setattr(db, "TIMEZONE", tokyo)
+    before = datetime.now(tokyo).replace(microsecond=0, tzinfo=None)
+    ssr.main()
+    after = datetime.now(tokyo).replace(tzinfo=None)
+
+    run_at = datetime.strptime(query("SELECT run_at FROM scan_runs")[0][0], "%Y-%m-%d %H:%M:%S")
+    assert before <= run_at <= after
+    assert query("SELECT DISTINCT as_of FROM share_structure") == [(run_at.date().isoformat(),)]
+    assert query("SELECT DISTINCT trade_date FROM daily_levels") == [(run_at.date().isoformat(),)]
+
+
+@pytest.mark.parametrize("utc, local", [
+    ("2026-07-01 12:00:00", "2026-07-01 08:00:00"),  # EDT, UTC-4
+    ("2026-01-15 12:00:00", "2026-01-15 07:00:00"),  # EST, UTC-5
+    ("2026-11-01 05:30:00", "2026-11-01 01:30:00"),  # last 1:30 EDT before the switch
+    ("2026-11-01 06:30:00", "2026-11-01 01:30:00"),  # repeated 1:30, now EST
+    ("2026-03-08 07:30:00", "2026-03-08 03:30:00"),  # 2:00-3:00 is skipped in spring
+])
+def test_utc_to_local_applies_daylight_saving(monkeypatch: pytest.MonkeyPatch, utc: str, local: str) -> None:
+    monkeypatch.setattr(db, "TIMEZONE", ZoneInfo("America/New_York"))
+    assert db.utc_to_local(utc) == local
+
+
+def test_new_database_column_default_is_local(offline: dict[str, Any]) -> None:
+    db.init_db()
+    with db.connect() as conn:
+        conn.execute("INSERT INTO scan_runs (criteria) VALUES ('crit')")
+
+    run_at = datetime.strptime(query("SELECT run_at FROM scan_runs")[0][0], "%Y-%m-%d %H:%M:%S")
+    assert abs(run_at - datetime.now()) < timedelta(seconds=5)
+
+
+def test_missing_share_value_keeps_earlier_one(offline: dict[str, Any]) -> None:
+    ssr.main()
+    row = make_row("AAA", price=2.6)
+    del row["numbers"]["shortInterestShare"]
+    row["numbers"]["sharesOutstanding2"] = 7.0
+    offline["rows"] = [row]
+    ssr.main()
+
+    assert query(
+        "SELECT float_shares, shares_outstanding, short_float_pct FROM share_structure s "
+        "JOIN symbols y ON y.id = s.symbol_id WHERE y.symbol = 'AAA'"
+    ) == [(4_500_000, 7_000_000, 12.5)]
 
 
 def test_main_links_companies_by_cik(offline: dict[str, Any]) -> None:
@@ -109,15 +262,23 @@ def test_main_links_companies_by_cik(offline: dict[str, Any]) -> None:
     ) == [("AAA", 111, "AAA Corp"), ("BBB", 222, "BBB Inc"), ("CCC", None, None)]
 
 
-def test_identical_rerun_is_skipped(offline: dict[str, Any]) -> None:
+def test_identical_rerun_is_skipped(offline: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
     ssr.main()
+    assert "saved run 1: 3 tickers" in capsys.readouterr().err
     ssr.main()
+    assert "skipped: unchanged since run 1 (3 tickers)" in capsys.readouterr().err
 
     assert query("SELECT COUNT(*) FROM scan_runs") == [(1,)]
     assert query("SELECT COUNT(*) FROM symbols") == [(3,)]
 
 
-@pytest.mark.parametrize("changed", [ROWS[::-1], ROWS[:2], ROWS + [make_row("DDD")]])
+@pytest.mark.parametrize("changed", [
+    ROWS[::-1],
+    ROWS[:2],
+    ROWS + [make_row("DDD")],
+    [make_row("AAA", price=2.6), ROWS[1], ROWS[2]],
+    [make_row("AAA", gap=25.0), ROWS[1], ROWS[2]],
+], ids=["reordered", "dropped", "added", "price moved", "gap moved"])
 def test_changed_list_saves_new_run(offline: dict[str, Any], changed: list[dict[str, Any]]) -> None:
     ssr.main()
     offline["rows"] = changed
@@ -168,7 +329,7 @@ def test_migrates_legacy_json_table(offline: dict[str, Any]) -> None:
     db.init_db()
 
     assert query("SELECT name FROM sqlite_master WHERE name = 'screener'") == []
-    assert query("SELECT run_at, criteria FROM scan_runs") == [("2026-01-02 08:00:00", "crit")]
+    assert query("SELECT run_at, criteria FROM scan_runs") == [(utc_to_local("2026-01-02 08:00:00"), "crit")]
     assert db.latest_vt_symbols() == ["AAA.NASDAQ", "BBB.NYSE"]
 
 
@@ -245,10 +406,14 @@ def test_screener_saves_without_sec(offline: dict[str, Any]) -> None:
 def test_live_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sec, "CACHE_PATH", tmp_path / "sec_company_tickers.json")
 
-    rows = ssr.scrape_rows(ssr.url)
-    for row in rows:
-        assert row["text"]["exchange"] in ssr.EXCHANGES
-        assert {"price", "gap", "change", "relativeVolume", "volume", "sharesFloat", "prevClose"} <= set(row["numbers"])
+    for url in ssr.SCREENS.values():
+        rows = ssr.scrape_rows(url)
+        for row in rows:
+            assert row["text"]["exchange"] in ssr.EXCHANGES
+            assert {
+                "price", "gap", "change", "relativeVolume", "volume", "sharesFloat", "prevClose",
+                "sharesOutstanding2", "shortInterestShare", "shortInterestRatio",
+            } <= set(row["numbers"])
 
     cik_map = sec.load_cik_map()
     assert len(cik_map) > 5000
