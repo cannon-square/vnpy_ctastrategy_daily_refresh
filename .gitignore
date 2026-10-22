@@ -129,3 +129,6 @@ dmypy.json
 
 # Type checker / linter / test caches
 .ruff_cache/
+
+# Screener database and SEC ticker cache
+data/
