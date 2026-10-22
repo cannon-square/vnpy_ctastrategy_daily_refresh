@@ -9,8 +9,10 @@ Each run writes:
     companies       -> one row per new company, keyed by its SEC CIK
     symbols         -> one row per new listing (symbol, exchange, company), e.g. ("WORX", "NASDAQ", 3)
     scan_results    -> one row per ticker: rank, price, gap %, change %, rel volume, volume
-    share_structure -> today's float, shares outstanding, short float % and short ratio for each ticker
+    share_structure -> today's float, shares outstanding, short float %, short ratio and
+                       recent offering flag for each ticker
     daily_levels    -> today's previous close for each ticker
+    news            -> new finviz headlines and SEC filings for each ticker (catalysts.py)
 
 A run whose tickers (in rank order) and numbers all match the previous run of
 the same screen is not saved. Prints the vnpy vt_symbols (SYMBOL.EXCHANGE) joined with "," for the
@@ -27,6 +29,7 @@ import requests
 from finviz.helper_functions.request_functions import USER_AGENT
 from lxml import html
 
+from catalysts import update_catalysts
 from db import connect, get_company_id, get_symbol_id, init_db, now, now_text
 from sec import load_cik_map
 
@@ -118,13 +121,16 @@ def main(screen: str = "premarket") -> None:
         else:
             print(f"{screen}: skipped: unchanged since run {previous_run} ({len(tickers)} tickers)", file=sys.stderr)
 
+        listings: list[tuple[int, str, int | None]] = []
         for rank, (row, (symbol, exchange)) in enumerate(zip(rows, tickers, strict=True), start=1):
             numbers = row["numbers"]
             company_id = None
+            cik: int | None = None
             if symbol in cik_map:
                 cik, name = cik_map[symbol]
                 company_id = get_company_id(conn, cik, name)
             symbol_id = get_symbol_id(conn, symbol, exchange, company_id)
+            listings.append((symbol_id, symbol, cik))
             if run_id is not None:
                 conn.execute(
                     """
@@ -168,6 +174,9 @@ def main(screen: str = "premarket") -> None:
                     """,
                     (symbol_id, today, numbers["prevClose"]),
                 )
+
+    # The run is saved first; news checks are slower and allowed to fail.
+    update_catalysts(listings)
 
     print(",".join(f"{symbol}.{exchange}" for symbol, exchange in tickers))
 

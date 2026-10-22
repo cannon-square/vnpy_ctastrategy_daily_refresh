@@ -82,7 +82,9 @@ CREATE TABLE IF NOT EXISTS scan_results (
     PRIMARY KEY (run_id, symbol_id)
 );
 
--- News catalyst
+-- News catalyst: finviz headlines and SEC filings. source is the news outlet or
+-- "SEC EDGAR"; category is offering, reverse_split, fda, earnings, merger,
+-- contract, filing or other (see catalysts.py).
 CREATE TABLE IF NOT EXISTS news (
     id           INTEGER PRIMARY KEY,
     symbol_id    INTEGER NOT NULL REFERENCES symbols(id),
@@ -94,7 +96,16 @@ CREATE TABLE IF NOT EXISTS news (
     UNIQUE (symbol_id, url)
 );
 
--- Float and dilution, one snapshot per day
+-- When each symbol was last checked for news, per source ("finviz", "sec")
+CREATE TABLE IF NOT EXISTS source_checks (
+    symbol_id  INTEGER NOT NULL REFERENCES symbols(id),
+    source     TEXT NOT NULL,
+    checked_at DATETIME NOT NULL,
+    PRIMARY KEY (symbol_id, source)
+);
+
+-- Float and dilution, one snapshot per day. recent_offering is 1 when an
+-- offering headline or filing was published in the last 90 days.
 CREATE TABLE IF NOT EXISTS share_structure (
     symbol_id          INTEGER NOT NULL REFERENCES symbols(id),
     as_of              DATE NOT NULL,

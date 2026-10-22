@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import pytest
 import requests
 
+import catalysts
 import db
 import save_screener_results as ssr
 import sec
@@ -47,6 +48,9 @@ class FakeResponse:
     def raise_for_status(self) -> None:
         pass
 
+    def json(self) -> Any:
+        return json.loads(self.text)
+
 
 def finviz_page(rows: list[dict[str, Any]], url: str, page_size: int = 2) -> FakeResponse:
     start: int = int(parse_qs(urlparse(url).query)["r"][0]) - 1
@@ -54,12 +58,39 @@ def finviz_page(rows: list[dict[str, Any]], url: str, page_size: int = 2) -> Fak
     return FakeResponse(f"<html><script data-ssr-props>{json.dumps({'data': data})}</script></html>")
 
 
+def news_page(rows: list[tuple[str, str, str, str]]) -> str:
+    """A finviz quote page news table from (time cell, headline, href, source) rows."""
+    trs = "".join(
+        f'<tr><td>{stamp}</td><td><div class="news-link-left"><a class="tab-link-news" href="{href}">{headline}</a>'
+        f'</div><div class="news-link-right"><span>({source})</span></div></td></tr>'
+        for stamp, headline, href, source in rows
+    )
+    return f'<html><table id="news-table">{trs}</table></html>'
+
+
+def submissions(filings: list[tuple[str, datetime, str]]) -> dict[str, Any]:
+    """An SEC submissions file from (form, accepted UTC, 8-K items) filings."""
+    return {"filings": {"recent": {
+        "form": [f[0] for f in filings],
+        "acceptanceDateTime": [f[1].strftime("%Y-%m-%dT%H:%M:%S.000Z") for f in filings],
+        "items": [f[2] for f in filings],
+        "primaryDocDescription": [f"{f[0]} doc" for f in filings],
+        "accessionNumber": [f"0000000000-26-{i:06d}" for i in range(len(filings))],
+        "primaryDocument": [f"doc{i}.htm" for i in range(len(filings))],
+    }}}
+
+
 @pytest.fixture
 def offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[str, Any]]:
-    """Point the database and SEC cache at tmp_path and fake both websites."""
+    """Point the database and SEC cache at tmp_path and fake finviz and the SEC."""
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "screener.db")
     monkeypatch.setattr(sec, "CACHE_PATH", tmp_path / "sec_company_tickers.json")
-    state: dict[str, Any] = {"rows": ROWS, "sec_online": True, "sec_calls": 0}
+    monkeypatch.setattr(catalysts, "FINVIZ_DELAY", 0)
+    state: dict[str, Any] = {
+        "rows": ROWS, "sec_online": True, "sec_calls": 0,
+        "news": {}, "news_calls": 0, "news_error": False,
+        "filings": {}, "filings_calls": 0,
+    }
 
     def fake_get(url: str, **kwargs: Any) -> FakeResponse:
         if url == sec.TICKERS_URL:
@@ -67,6 +98,18 @@ def offline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[dict[st
             if not state["sec_online"]:
                 raise requests.ConnectionError("offline")
             return FakeResponse(json.dumps(SEC_FILE))
+        if url.startswith("https://data.sec.gov/submissions/"):
+            state["filings_calls"] += 1
+            if not state["sec_online"]:
+                raise requests.ConnectionError("offline")
+            cik = int(url.rsplit("CIK", 1)[1].split(".")[0])
+            return FakeResponse(json.dumps(submissions(state["filings"].get(cik, []))))
+        if "/quote.ashx" in url:
+            state["news_calls"] += 1
+            if state["news_error"]:
+                raise requests.HTTPError("429 Too Many Requests")
+            ticker = parse_qs(urlparse(url).query)["t"][0]
+            return FakeResponse(news_page(state["news"].get(ticker, [])))
         return finviz_page(state["rows"], url)
 
     monkeypatch.setattr(requests, "get", fake_get)
@@ -417,3 +460,124 @@ def test_live_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     cik_map = sec.load_cik_map()
     assert len(cik_map) > 5000
+
+    # AAPL always has recent news and filings.
+    news = catalysts.fetch_finviz_news("AAPL")
+    assert len(news) > 10
+    assert all(item.headline and item.url.startswith("http") for item in news)
+    filings = sec.load_filings(cik_map["AAPL"][0])
+    assert filings and {"form", "accepted", "items", "description", "url"} <= set(filings[0])
+
+
+# News catalysts --------------------------------------------------------------
+
+def local(when: datetime) -> str:
+    return when.astimezone(db.TIMEZONE).strftime(db.TIME_FORMAT)
+
+
+def test_parse_finviz_news_time_formats() -> None:
+    page = news_page([
+        ("Today 08:30AM", "Acme Announces FDA Approval", "/news/1/acme", "ACCESSWIRE"),
+        ("07:05AM", "Acme Prices $5M Registered Direct Offering", "https://example.com/2", "GlobeNewswire"),
+        ("Oct-20-26 04:15PM", "Acme Reports Third Quarter Results", "https://example.com/3", "Business Wire"),
+        ("09:00AM", "Acme Signs Supply Agreement", "https://example.com/4", "PR Newswire"),
+    ])
+    items = catalysts.parse_finviz_news(page, today=datetime(2026, 10, 21).date())
+
+    eastern = ZoneInfo("America/New_York")
+    assert [(i.published_at, i.category, i.source) for i in items] == [
+        (datetime(2026, 10, 21, 8, 30, tzinfo=eastern), "fda", "ACCESSWIRE"),
+        (datetime(2026, 10, 21, 7, 5, tzinfo=eastern), "offering", "GlobeNewswire"),
+        (datetime(2026, 10, 20, 16, 15, tzinfo=eastern), "earnings", "Business Wire"),
+        (datetime(2026, 10, 20, 9, 0, tzinfo=eastern), "contract", "PR Newswire"),
+    ]
+    assert items[0].url == "https://finviz.com/news/1/acme"
+
+
+@pytest.mark.parametrize("headline, category", [
+    ("XYZ Announces Pricing of $10 Million Public Offering", "offering"),
+    ("XYZ Enters Into Securities Purchase Agreement for Private Placement", "offering"),
+    ("XYZ Announces 1-for-20 Reverse Stock Split", "reverse_split"),
+    ("XYZ Receives FDA Clearance", "fda"),
+    ("XYZ Phase 2 Trial Meets Primary Endpoint", "fda"),
+    ("XYZ Reports Q3 2026 Financial Results", "earnings"),
+    ("XYZ to Acquire ABC in All-Stock Merger", "merger"),
+    ("XYZ Wins $3M Government Contract", "contract"),
+    ("XYZ to Present at Investor Conference", "other"),
+])
+def test_categorize_headline(headline: str, category: str) -> None:
+    assert catalysts.categorize_headline(headline) == category
+
+
+@pytest.mark.parametrize("form, items, category", [
+    ("424B5", "", "offering"), ("S-1/A", "", "offering"), ("F-3", "", "offering"),
+    ("8-K", "1.01,3.02,9.01", "offering"), ("8-K", "2.01,9.01", "merger"),
+    ("8-K", "2.02,9.01", "earnings"), ("8-K", "1.01,9.01", "contract"),
+    ("10-Q", "", "earnings"), ("S-8", "", "filing"), ("8-K", "5.07", "filing"),
+])
+def test_categorize_filing(form: str, items: str, category: str) -> None:
+    assert catalysts.categorize_filing(form, items) == category
+
+
+def test_main_saves_news_and_flags_recent_offering(offline: dict[str, Any]) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    offline["news"] = {"CCC": [("Oct-20-26 08:30AM", "CCC Announces Reverse Stock Split", "https://example.com/ccc", "PRN")]}
+    offline["filings"] = {
+        111: [("424B5", now - timedelta(days=10), ""), ("8-K", now - timedelta(days=12), "2.02,9.01")],
+        222: [("424B5", now - timedelta(days=200), "")],  # outside the 90-day window
+    }
+    ssr.main()
+
+    assert query("SELECT s.symbol, n.published_at, n.headline, n.source, n.category FROM news n "
+                 "JOIN symbols s ON s.id = n.symbol_id ORDER BY s.symbol, n.published_at") == [
+        ("AAA", local(now - timedelta(days=12)), "8-K: 8-K doc", "SEC EDGAR", "earnings"),
+        ("AAA", local(now - timedelta(days=10)), "424B5: 424B5 doc", "SEC EDGAR", "offering"),
+        ("CCC", local(datetime(2026, 10, 20, 8, 30, tzinfo=ZoneInfo("America/New_York"))),
+         "CCC Announces Reverse Stock Split", "PRN", "reverse_split"),
+    ]
+    assert query("SELECT url FROM news WHERE category = 'offering'") == [
+        ("https://www.sec.gov/Archives/edgar/data/111/000000000026000000/doc0.htm",)
+    ]
+    assert query("SELECT s.symbol, x.recent_offering FROM share_structure x JOIN symbols s ON s.id = x.symbol_id "
+                 "ORDER BY s.symbol") == [("AAA", 1), ("BBB", 0), ("CCC", 0)]
+
+
+def test_news_checks_are_throttled(offline: dict[str, Any]) -> None:
+    ssr.main()
+    assert (offline["news_calls"], offline["filings_calls"]) == (3, 2)  # CCC has no CIK
+
+    offline["rows"] = ROWS[::-1]  # a changed list, so the run is saved
+    ssr.main()
+    assert (offline["news_calls"], offline["filings_calls"]) == (3, 2)
+
+    with db.connect() as conn:
+        stale = (db.now() - catalysts.CHECK_INTERVAL).strftime(db.TIME_FORMAT)
+        conn.execute("UPDATE source_checks SET checked_at = ?", (stale,))
+    ssr.main()
+    assert (offline["news_calls"], offline["filings_calls"]) == (6, 4)
+
+
+def test_duplicate_news_is_not_saved_twice(offline: dict[str, Any]) -> None:
+    offline["news"] = {"AAA": [("Today 08:30AM", "AAA Wins Contract", "https://example.com/a", "PRN")]}
+    ssr.main()
+    with db.connect() as conn:
+        conn.execute("DELETE FROM source_checks")
+    ssr.main()
+
+    assert query("SELECT COUNT(*) FROM news") == [(1,)]
+
+
+def test_news_failure_keeps_run_and_retries(offline: dict[str, Any], capsys: pytest.CaptureFixture[str]) -> None:
+    offline["news_error"] = True
+    ssr.main()
+
+    err = capsys.readouterr().err
+    assert "news: finviz check for AAA failed: 429 Too Many Requests" in err
+    assert query("SELECT COUNT(*) FROM scan_results") == [(3,)]
+    assert query("SELECT DISTINCT source FROM source_checks") == [("sec",)]
+
+    offline["news_error"] = False
+    calls = offline["news_calls"]
+    offline["rows"] = ROWS[::-1]
+    ssr.main()
+    assert offline["news_calls"] == calls + 3

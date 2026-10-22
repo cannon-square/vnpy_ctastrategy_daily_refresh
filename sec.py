@@ -15,6 +15,8 @@ import requests
 from vnpy.trader.setting import SETTINGS
 
 TICKERS_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
+SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession}/{document}"
 CACHE_PATH = Path(__file__).resolve().parent / "data" / "sec_company_tickers.json"
 CACHE_MAX_AGE = 24 * 60 * 60
 CONTACT_EMAIL = SETTINGS.get("sec.contact_email") or "admin@example.com"
@@ -39,3 +41,28 @@ def load_cik_map() -> dict[str, tuple[int, str]]:
     fields = data["fields"]
     cik_i, name_i, ticker_i = fields.index("cik"), fields.index("name"), fields.index("ticker")
     return {row[ticker_i]: (int(row[cik_i]), row[name_i]) for row in data["data"]}
+
+
+def load_filings(cik: int) -> list[dict[str, str]]:
+    """Return the company's recent filings, newest first.
+
+    Each filing has form, accepted (UTC, ISO 8601), items (8-K item numbers,
+    comma separated), description and url. Raises requests.RequestException.
+    """
+    response = requests.get(SUBMISSIONS_URL.format(cik=cik), headers={"User-Agent": USER_AGENT}, timeout=30)
+    response.raise_for_status()
+    recent = response.json()["filings"]["recent"]
+    return [
+        {
+            "form": recent["form"][i],
+            "accepted": recent["acceptanceDateTime"][i],
+            "items": recent["items"][i],
+            "description": recent["primaryDocDescription"][i] or recent["form"][i],
+            "url": ARCHIVE_URL.format(
+                cik=cik,
+                accession=recent["accessionNumber"][i].replace("-", ""),
+                document=recent["primaryDocument"][i],
+            ),
+        }
+        for i in range(len(recent["form"]))
+    ]
